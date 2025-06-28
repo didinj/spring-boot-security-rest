@@ -1,14 +1,13 @@
 package com.djamware.SecurityRest.configs;
 
-import java.util.Base64;
+import java.security.Key;
 import java.util.Date;
 import java.util.Set;
 
-import javax.annotation.PostConstruct;
-import javax.servlet.http.HttpServletRequest;
+import javax.crypto.SecretKey;
 
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.security.authentication.AuthenticationCredentialsNotFoundException;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.userdetails.UserDetails;
@@ -18,67 +17,95 @@ import com.djamware.SecurityRest.models.Role;
 import com.djamware.SecurityRest.services.CustomUserDetailsService;
 
 import io.jsonwebtoken.Claims;
-import io.jsonwebtoken.Jws;
-import io.jsonwebtoken.JwtException;
+import io.jsonwebtoken.ExpiredJwtException;
 import io.jsonwebtoken.Jwts;
-import io.jsonwebtoken.SignatureAlgorithm;
+import io.jsonwebtoken.MalformedJwtException;
+import io.jsonwebtoken.UnsupportedJwtException;
+import io.jsonwebtoken.io.Decoders;
+import io.jsonwebtoken.security.Keys;
+import jakarta.annotation.PostConstruct;
+import jakarta.servlet.http.HttpServletRequest;
 
 @Component
 public class JwtTokenProvider {
 
-	@Value("${security.jwt.token.secret-key:secret}")
-    private String secretKey = "secret";
-	
-    @Value("${security.jwt.token.expire-length:3600000}")
-    private long validityInMilliseconds = 3600000; // 1h
-    
-    @Autowired
-    private CustomUserDetailsService userDetailsService;
-    
+    @Value("${security.jwt.token.secret-key:secret}")
+    private String secret;
+
+    @Value("${security.jwt.token.expire-length:3600000}") // 1 hour
+    private long validityInMilliseconds;
+
+    private Key secretKey;
+
+    private final CustomUserDetailsService userDetailsService;
+
+    public JwtTokenProvider(CustomUserDetailsService userDetailsService) {
+        this.userDetailsService = userDetailsService;
+    }
+
     @PostConstruct
     protected void init() {
-        secretKey = Base64.getEncoder().encodeToString(secretKey.getBytes());
+        // Decode the secret key using Base64 and prepare the HMAC key
+        byte[] keyBytes = Decoders.BASE64.decode(secret);
+        this.secretKey = Keys.hmacShaKeyFor(keyBytes);
     }
-    
-    public String createToken(String username, Set<Role> set) {
-        Claims claims = Jwts.claims().setSubject(username);
-        claims.put("roles", set);
+
+    public String createToken(String username, Set<Role> roles) {
         Date now = new Date();
-        Date validity = new Date(now.getTime() + validityInMilliseconds);
-        return Jwts.builder()//
-            .setClaims(claims)//
-            .setIssuedAt(now)//
-            .setExpiration(validity)//
-            .signWith(SignatureAlgorithm.HS256, secretKey)//
-            .compact();
+        Date expiry = new Date(now.getTime() + validityInMilliseconds);
+
+        return Jwts.builder()
+                .subject(username)
+                .claim("roles", roles) // Use .claim() directly instead of Jwts.claims()
+                .issuedAt(now)
+                .expiration(expiry)
+                .signWith(secretKey)
+                .compact();
     }
-    
+
     public Authentication getAuthentication(String token) {
-        UserDetails userDetails = this.userDetailsService.loadUserByUsername(getUsername(token));
+        String username = getUsername(token);
+        UserDetails userDetails = this.userDetailsService.loadUserByUsername(username);
         return new UsernamePasswordAuthenticationToken(userDetails, "", userDetails.getAuthorities());
     }
-    
+
     public String getUsername(String token) {
-        return Jwts.parser().setSigningKey(secretKey).parseClaimsJws(token).getBody().getSubject();
+        Claims claims = extractAllClaims(token);
+        return claims.getSubject();
     }
-    
-    public String resolveToken(HttpServletRequest req) {
-        String bearerToken = req.getHeader("Authorization");
-        if (bearerToken != null && bearerToken.startsWith("Bearer ")) {
-            return bearerToken.substring(7, bearerToken.length());
-        }
-        return null;
+
+    private Claims extractAllClaims(String token) {
+        return Jwts
+                .parser()
+                .verifyWith(getSignInKey())
+                .build()
+                .parseSignedClaims(token)
+                .getPayload();
     }
-    
+
+    private SecretKey getSignInKey() {
+        byte[] keyBytes = secret.getBytes();
+        return Keys.hmacShaKeyFor(keyBytes);
+    }
+
+    public String resolveToken(HttpServletRequest request) {
+        String bearer = request.getHeader("Authorization");
+        return (bearer != null && bearer.startsWith("Bearer ")) ? bearer.substring(7) : null;
+    }
+
     public boolean validateToken(String token) {
         try {
-            Jws<Claims> claims = Jwts.parser().setSigningKey(secretKey).parseClaimsJws(token);
-            if (claims.getBody().getExpiration().before(new Date())) {
-                return false;
-            }
+            SecretKey key = getSignInKey();
+            Jwts.parser().verifyWith(key).build().parseSignedClaims(token);
             return true;
-        } catch (JwtException | IllegalArgumentException e) {
-            throw new JwtException("Expired or invalid JWT token");
+        } catch (SecurityException | MalformedJwtException e) {
+            throw new AuthenticationCredentialsNotFoundException("JWT was expired or incorrect");
+        } catch (ExpiredJwtException e) {
+            throw new AuthenticationCredentialsNotFoundException("Expired JWT token.");
+        } catch (UnsupportedJwtException e) {
+            throw new AuthenticationCredentialsNotFoundException("Unsupported JWT token.");
+        } catch (IllegalArgumentException e) {
+            throw new AuthenticationCredentialsNotFoundException("JWT token compact of handler are invalid.");
         }
     }
 }

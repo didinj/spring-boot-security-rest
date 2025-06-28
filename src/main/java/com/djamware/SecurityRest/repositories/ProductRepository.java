@@ -5,7 +5,6 @@ import org.springframework.data.repository.CrudRepository;
 import com.djamware.SecurityRest.models.Product;
 
 public interface ProductRepository extends CrudRepository<Product, String> {
-	
-	@Override
+    @Override
     void delete(Product deleted);
 }
